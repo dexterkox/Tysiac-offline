@@ -153,7 +153,8 @@ workflows:
     publishing:
       email:
         recipients:
-          - CHANGE_ME@example.com     # tu przyjdzie link do gotowego APK
+          - radoslawgilewski93@gmail.com 
+          # tu przyjdzie link do gotowego APK
         notify:
           success: true
           failure: true
