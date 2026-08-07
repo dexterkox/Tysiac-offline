@@ -1,0 +1,20 @@
+# =============================================================================
+# Konfiguracja dla Render. Dzięki temu plikowi nie trzeba ustawiać niczego
+# ręcznie — Render odczyta stąd, jak uruchomić serwer.
+#
+# Umieść ten plik w GŁÓWNYM katalogu repozytorium (nie w folderze server).
+# =============================================================================
+
+services:
+  - type: web
+    name: tysiac-stoly
+    runtime: node
+    plan: free
+    region: frankfurt          # najbliżej Polski w darmowym planie
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /zdrowie
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
