@@ -24,7 +24,7 @@ function fail(msg) { console.error(msg); process.exit(1); }
 function prepare() {
   const moves = [
     ['index.html',            'www/index.html'],
-    ['MultipeerPlugin.kt',    'native-android/MultipeerPlugin.kt'],
+    ['MultipeerPlugin.java',  'native-android/MultipeerPlugin.java'],
     ['MultipeerPlugin.swift', 'native/MultipeerPlugin.swift']
   ];
   moves.forEach(([from, to]) => {
@@ -47,14 +47,14 @@ function setupAndroid() {
   const JAVA_DIR = path.join(ROOT, 'android', 'app', 'src', 'main', 'java', ...PKG_PATH);
   const MANIFEST = path.join(ROOT, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
   const GRADLE = path.join(ROOT, 'android', 'app', 'build.gradle');
-  const SRC_KT = path.join(ROOT, 'native-android', 'MultipeerPlugin.kt');
+  const SRC_KT = path.join(ROOT, 'native-android', 'MultipeerPlugin.java');
   
   
   /* --- 1. plik wtyczki --------------------------------------------------- */
   function copyPlugin() {
     if (!fs.existsSync(JAVA_DIR)) fail('Brak projektu Android — uruchom najpierw "npx cap add android".');
-    fs.copyFileSync(SRC_KT, path.join(JAVA_DIR, 'MultipeerPlugin.kt'));
-    console.log('Skopiowano MultipeerPlugin.kt');
+    fs.copyFileSync(SRC_KT, path.join(JAVA_DIR, 'MultipeerPlugin.java'));
+    console.log('Skopiowano MultipeerPlugin.java');
   }
   
   /* --- 2. rejestracja w MainActivity ------------------------------------- */
