@@ -1,0 +1,19 @@
+# Konfiguracja dla Fly.io. Nazwę aplikacji podmień na własną, jeśli zajęta.
+app = "tysiac-stoly"
+primary_region = "waw"          # Warszawa — najmniejsze opóźnienia w Polsce
+
+[build]
+  builder = "heroku/builder:24"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Serwer musi być stale włączony: usypianie oznacza kilkanaście sekund
+  # oczekiwania dla pierwszego gracza, co wygląda jak awaria.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
