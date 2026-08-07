@@ -207,6 +207,7 @@ extension MultipeerPlugin: MCSessionDelegate {
         }
     }
 
+
     public func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
         let text = String(decoding: data, as: UTF8.self)
         notifyListeners("data", data: ["name": peerID.displayName, "data": text])
