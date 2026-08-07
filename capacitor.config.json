@@ -1,0 +1,20 @@
+{
+  "appId": "pl.tysiac.gra",
+  "appName": "Tysiąc",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https",
+    "iosScheme": "capacitor"
+  },
+  "ios": {
+    "contentInset": "always",
+    "backgroundColor": "#1B4332"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "backgroundColor": "#1B4332",
+      "showSpinner": false
+    }
+  }
+}
