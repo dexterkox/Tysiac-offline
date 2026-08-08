@@ -11,8 +11,18 @@
    przez Bluetooth. Dzięki temu zasady istnieją w jednym miejscu i nie ma ryzyka,
    że gra online zacznie się różnić od offline.
 
-   Wiadomości są maleńkie (zagrana karta to kilkaset bajtów), więc setka stołów
-   zmieści się na najmniejszej maszynie.
+   ----------------------------------------------------------------------------
+   Cykl życia stołu (lifecycle):
+
+     • Tożsamością gracza jest trwały, anonimowy identyfikator „pid" zapisany na
+       jego urządzeniu. Pseudonim ani gniazdo nie są tożsamością — gniazdo to
+       tylko bieżące połączenie.
+     • Jeden pid może być gospodarzem najwyżej jednego aktywnego stołu.
+     • Stół żyje na serwerze niezależnie od połączeń. Rozłączenie NIE zwalnia
+       miejsca — rezerwuje je. Świadome „wyjście" — zwalnia.
+     • TTL (15 min) biegnie WYŁĄCZNIE, gdy przy stole nie ma ani jednego
+       połączonego człowieka. Boty się nie liczą. Powrót człowieka anuluje TTL.
+     • Serwer jest źródłem prawdy o składzie stołu i rozsyła go jako „roster".
    ========================================================================== */
 
 const http = require('http');
@@ -22,17 +32,27 @@ const PORT = process.env.PORT || 8080;
 
 /* ---------------------------------------------------------------- stan */
 
-/** numer stołu -> { no, host, hostName, avatar, seats, bombs, guests:Set, started } */
+/**
+ * numer stołu -> {
+ *   no, hostPid, maxSeats, bombs, started,
+ *   seats:  [ Seat | null ]   // uporządkowana tablica miejsc dla ludzi
+ *   bots:   [ {name, avatar} ]// boty deklarowane przez gospodarza (bez pid, bez połączenia)
+ *   gra, numerGracza:Map<pid,nrWpartii>, stany:{[pid]:payload},
+ *   ttlTimer, timerGry, spi
+ * }
+ * Seat = { pid, name, avatar, role:'host'|'guest', connected:bool, socket:socket|null }
+ */
 const tables = new Map();
 const SILNIK = require('./silnik.js');
 
-/** Ile stół żyje po odejściu wszystkich — tyle czasu można wrócić pod tym samym numerem. */
-const CZAS_ZYCIA_MS = 15 * 60 * 1000;
+/** Ile stół żyje BEZ żadnego połączonego człowieka — tyle czasu można wrócić pod tym samym numerem.
+    Nadpisywalne przez środowisko, żeby testy nie musiały czekać kwadransa. */
+const CZAS_ZYCIA_MS = parseInt(process.env.TABLE_TTL_MS, 10) > 0
+  ? parseInt(process.env.TABLE_TTL_MS, 10)
+  : 15 * 60 * 1000;
 
-/** gniazdo -> { id, name, avatar, tableNo, role } */
+/** gniazdo -> { pid, name, avatar, tableNo, role } */
 const clients = new Map();
-
-let nextId = 1;
 
 function newTableNumber() {
   /* Numer zamiast nazwy własnej: nie ma czego moderować, a stół rozpoznaje się
@@ -49,22 +69,155 @@ function send(socket, obj) {
   try { socket.send(JSON.stringify(obj)); } catch (e) { /* zerwane łącze */ }
 }
 
+/* ----------------------------------------------------- pomocnicy stołu */
+
+function seatIndexOfPid(t, pid) {
+  if (!pid) return -1;
+  for (let i = 0; i < t.seats.length; i++) {
+    const s = t.seats[i];
+    if (s && s.pid === pid) return i;
+  }
+  return -1;
+}
+
+function hostSeat(t) {
+  return t.seats.find(s => s && s.role === 'host') || null;
+}
+
+function hostName(t) {
+  const h = hostSeat(t);
+  return h ? h.name : '—';
+}
+
+/** Ilu PRAWDZIWYCH ludzi jest w tej chwili połączonych przy stole. Boty i puste miejsca
+    się nie liczą — to jedyna liczba, która decyduje o TTL. */
+function humansOnline(t) {
+  let n = 0;
+  for (const s of t.seats) if (s && s.pid && s.connected) n++;
+  return n;
+}
+
+function pidHostsTable(pid) {
+  for (const t of tables.values()) if (t.hostPid === pid) return t;
+  return null;
+}
+
+/** Widok składu wysyłany klientom: ludzie na swoich miejscach + boty wypełniające luki. */
+function rosterView(t) {
+  const seats = [];
+  let bi = 0;
+  for (let i = 0; i < t.maxSeats; i++) {
+    const s = t.seats[i];
+    if (s) {
+      seats.push({ pid: s.pid, name: s.name, avatar: s.avatar, role: s.role, connected: !!s.connected });
+    } else if (bi < t.bots.length) {
+      const b = t.bots[bi++];
+      seats.push({ bot: true, name: b.name, avatar: b.avatar });
+    } else {
+      seats.push(null);
+    }
+  }
+  return {
+    type: 'roster',
+    no: t.no,
+    hostPid: t.hostPid,
+    started: !!t.started,
+    seats
+  };
+}
+
+/** Rozsyła aktualny skład do wszystkich połączonych ludzi przy stole. Serwer — nie host —
+    jest źródłem prawdy, więc nawet gdy gospodarz jest offline, roster nadal jest znany. */
+function sendRoster(t) {
+  const view = rosterView(t);
+  for (const s of t.seats) {
+    if (s && s.pid && s.socket) send(s.socket, view);
+  }
+}
+
 function tableSummary(t) {
+  const faces = [];
+  let bi = 0;
+  for (let i = 0; i < t.maxSeats; i++) {
+    const s = t.seats[i];
+    if (s) faces.push(s.avatar);
+    else if (bi < t.bots.length) faces.push(t.bots[bi++].avatar);
+  }
   return {
     no: t.no,
-    host: t.hostName,
-    avatar: t.avatar,
-    taken: 1 + t.guests.size,
-    seats: t.seats,
+    host: hostName(t),
+    avatar: hostSeat(t) ? hostSeat(t).avatar : '🦊',
+    faces,
+    taken: faces.length,
+    seats: t.maxSeats,
     bombs: t.bombs > 0,
     started: t.started,
     spi: !!t.spi
   };
 }
 
-/** Lista trafia tylko do tych, którzy jej szukają — nie zasypujemy grających. */
-/* Każdy gracz dostaje WŁASNY widok stanu — bez cudzych kart i bez zakrytego musika. */
-/* Rozsyła stan, a jeśli gra zatrzymała się na pauzie (karta na stole, pełna lewa),
+function broadcastTableList() {
+  const list = [...tables.values()]
+    .filter(t => t.spi || (!t.started && tableSummary(t).taken < t.maxSeats))
+    .map(tableSummary)
+    .sort((a, b) => a.no - b.no);
+
+  for (const [socket, c] of clients) {
+    if (c.role === 'browsing') send(socket, { type: 'tables', tables: list });
+  }
+}
+
+/* ----------------------------------------------------------- TTL / sen */
+
+function clearTTL(t) {
+  if (t.ttlTimer) { clearTimeout(t.ttlTimer); t.ttlTimer = null; }
+}
+
+function startTTL(t) {
+  if (t.ttlTimer) return;               /* już liczy — nie resetujemy odliczania */
+  t.ttlTimer = setTimeout(() => {
+    t.ttlTimer = null;
+    if (t.timerGry) { clearTimeout(t.timerGry); t.timerGry = null; }   /* zatrzymaj tykającą partię z botami */
+    tables.delete(t.no);
+    broadcastTableList();
+  }, CZAS_ZYCIA_MS);
+}
+
+/* Stół nie znika po odejściu graczy. Dopóki siedzi przy nim choć jeden połączony człowiek,
+   TTL nie biegnie w ogóle. Gdy zniknie ostatni — zaczyna się kwadrans, po którym stół
+   przepada. Powrót kogokolwiek przed czasem budzi stół i anuluje odliczanie. */
+function recomputeLifecycle(t) {
+  if (!tables.has(t.no)) return;
+  if (humansOnline(t) === 0) {
+    t.spi = true;
+    startTTL(t);
+  } else {
+    t.spi = false;
+    clearTTL(t);
+  }
+  broadcastTableList();
+}
+
+function closeTable(no, reason) {
+  const t = tables.get(no);
+  if (!t) return;
+  clearTTL(t);
+  if (t.timerGry) { clearTimeout(t.timerGry); t.timerGry = null; }
+  for (const s of t.seats) {
+    if (s && s.pid && s.socket) {
+      send(s.socket, { type: 'tableClosed', reason: reason || 'Stół został zamknięty.' });
+      const c = clients.get(s.socket);
+      if (c) { c.tableNo = null; c.role = 'idle'; }
+    }
+  }
+  tables.delete(no);
+  broadcastTableList();
+}
+
+/* -------------------------------------------------- rozsyłanie stanu gry */
+
+/* Każdy gracz dostaje WŁASNY widok stanu — bez cudzych kart i bez zakrytego musika.
+   Rozsyła stan, a jeśli gra zatrzymała się na pauzie (karta na stole, pełna lewa),
    po chwili sama ruszy dalej. Dzięki temu widać, co kto zagrał. */
 function rozeslijIKontynuuj(t) {
   /* Stan bez pauzy i bez oczekiwania jest przelotowy — zaraz zastąpi go następny.
@@ -90,58 +243,12 @@ function rozeslijIKontynuuj(t) {
 
 function rozeslijStan(t) {
   if (!t || !t.gra) return;
-  const wyslij = (sock) => {
-    const cl = sock && clients.get(sock);
-    if (!cl) return;
-    const numer = t.numerGracza ? t.numerGracza.get(String(cl.id)) : undefined;
-    if (numer === undefined) return;
-    send(sock, { type: 'stanGry', G: SILNIK.widokDla(t.gra, numer) });
-  };
-  wyslij(t.host);
-  for (const g of t.guests) wyslij(g);
-}
-
-function broadcastTableList() {
-  const list = [...tables.values()]
-    .filter(t => t.spi || (!t.started && 1 + t.guests.size < t.seats))
-    .map(tableSummary)
-    .sort((a, b) => a.no - b.no);
-
-  for (const [socket, c] of clients) {
-    if (c.role === 'browsing') send(socket, { type: 'tables', tables: list });
+  for (const s of t.seats) {
+    if (!s || !s.pid || !s.socket) continue;
+    const numer = t.numerGracza ? t.numerGracza.get(s.pid) : undefined;
+    if (numer === undefined) continue;
+    send(s.socket, { type: 'stanGry', G: SILNIK.widokDla(t.gra, numer) });
   }
-}
-
-/* Stół nie znika od razu po odejściu graczy. Przez kwadrans czeka pod tym samym numerem,
-   pamiętając ostatni stan gry — dzięki temu zminimalizowanie okna albo chwilowa utrata
-   zasięgu nie kończą partii. */
-function uspijTable(no) {
-  const t = tables.get(no);
-  if (!t) return;
-  if (t.timerZycia) clearTimeout(t.timerZycia);
-  t.spi = true;
-  t.timerZycia = setTimeout(() => {
-    tables.delete(no);
-    broadcastTableList();
-  }, CZAS_ZYCIA_MS);
-  broadcastTableList();
-}
-
-function obudzTable(t) {
-  if (t.timerZycia) { clearTimeout(t.timerZycia); t.timerZycia = null; }
-  t.spi = false;
-}
-
-function closeTable(no, reason) {
-  const t = tables.get(no);
-  if (!t) return;
-  for (const g of t.guests) {
-    send(g, { type: 'tableClosed', reason: reason || 'Gospodarz opuścił stół.' });
-    const c = clients.get(g);
-    if (c) { c.tableNo = null; c.role = 'idle'; }
-  }
-  tables.delete(no);
-  broadcastTableList();
 }
 
 /* ------------------------------------------------------------ obsługa */
@@ -152,11 +259,22 @@ function handle(socket, msg) {
 
   switch (msg.type) {
 
-    /* --- kim jestem --- */
+    /* --- kim jestem --- (pid jest obowiązkowy — bez niego nie ma tożsamości) */
     case 'hello': {
+      const pid = String(msg.pid || '').slice(0, 64);
+      if (!pid) { send(socket, { type: 'helloRejected', reason: 'Brak identyfikatora gracza (pid).' }); break; }
+      me.pid = pid;
       me.name = String(msg.name || 'Gracz').slice(0, 7);
       me.avatar = String(msg.avatar || '🦊').slice(0, 8);
-      send(socket, { type: 'welcome', id: me.id });
+
+      /* Czy ten pid ma gdzieś zarezerwowane miejsce? Jeśli tak — po powrocie (także po
+         restarcie aplikacji) można od razu wrócić do tego stołu. */
+      let resume = null;
+      for (const t of tables.values()) {
+        const idx = seatIndexOfPid(t, pid);
+        if (idx >= 0) { resume = { no: t.no, role: t.seats[idx].role, started: !!t.started }; break; }
+      }
+      send(socket, { type: 'welcome', pid, resume });
       break;
     }
 
@@ -169,21 +287,52 @@ function handle(socket, msg) {
 
     /* --- zakładam stół --- */
     case 'createTable': {
+      if (!me.pid) { send(socket, { type: 'createFailed', reason: 'Najpierw przedstaw się (pid).' }); break; }
+      /* Jeden pid = najwyżej jeden aktywny stół. */
+      const istniejacy = pidHostsTable(me.pid);
+      if (istniejacy) {
+        send(socket, { type: 'createFailed', reason: 'Masz już aktywny stół.', no: istniejacy.no });
+        break;
+      }
       const no = newTableNumber();
+      const maxSeats = Math.min(3, Math.max(2, parseInt(msg.seats, 10) || 3));
       const t = {
         no,
-        host: socket,
-        hostName: me.name,
-        avatar: me.avatar,
-        seats: Math.min(3, Math.max(2, parseInt(msg.seats, 10) || 3)),
+        hostPid: me.pid,
+        maxSeats,
         bombs: Math.min(2, Math.max(0, parseInt(msg.bombs, 10) || 0)),
-        guests: new Set(),
-        started: false
+        started: false,
+        seats: new Array(maxSeats).fill(null),
+        bots: [],
+        gra: null,
+        numerGracza: null,
+        stany: {},
+        ttlTimer: null,
+        timerGry: null,
+        spi: false
       };
+      t.seats[0] = { pid: me.pid, name: me.name, avatar: me.avatar, role: 'host', connected: true, socket };
       tables.set(no, t);
       me.role = 'host';
       me.tableNo = no;
-      send(socket, { type: 'tableCreated', no, seats: t.seats, bombs: t.bombs });
+      send(socket, { type: 'tableCreated', no, seats: t.maxSeats, bombs: t.bombs });
+      sendRoster(t);
+      broadcastTableList();
+      break;
+    }
+
+    /* --- host deklaruje boty przy stole (źródłem prawdy o składzie jest serwer) --- */
+    case 'syncBots': {
+      const t = tables.get(me.tableNo);
+      if (!t || t.hostPid !== me.pid || t.started) break;
+      const list = Array.isArray(msg.bots) ? msg.bots : [];
+      const humans = t.seats.filter(Boolean).length;
+      const maxBots = Math.max(0, t.maxSeats - humans);
+      t.bots = list.slice(0, maxBots).map((b, i) => ({
+        name: String((b && b.name) || ('Bot ' + i)).slice(0, 7),
+        avatar: String((b && b.avatar) || '🤖').slice(0, 8)
+      }));
+      sendRoster(t);
       broadcastTableList();
       break;
     }
@@ -192,75 +341,66 @@ function handle(socket, msg) {
     case 'joinTable': {
       const t = tables.get(parseInt(msg.no, 10));
       if (!t) { send(socket, { type: 'joinFailed', reason: 'Ten stół już nie istnieje.' }); break; }
-      if (t.started) { send(socket, { type: 'joinFailed', reason: 'Gra przy tym stole już trwa.' }); break; }
-      if (1 + t.guests.size >= t.seats) { send(socket, { type: 'joinFailed', reason: 'Stół jest pełny.' }); break; }
 
-      t.guests.add(socket);
+      /* Ten pid już tu siedzi (np. równoległa karta) — to powrót, nie nowe miejsce. */
+      const istn = seatIndexOfPid(t, me.pid);
+      if (istn >= 0) { attachToSeat(socket, t, istn); break; }
+
+      if (t.started) { send(socket, { type: 'joinFailed', reason: 'Gra przy tym stole już trwa.' }); break; }
+      const wolne = t.seats.indexOf(null);
+      const humans = t.seats.filter(Boolean).length;
+      if (wolne < 0 || humans >= t.maxSeats) { send(socket, { type: 'joinFailed', reason: 'Stół jest pełny.' }); break; }
+
+      t.seats[wolne] = { pid: me.pid, name: me.name, avatar: me.avatar, role: 'guest', connected: true, socket };
+      /* Boty ustępują ludziom — jeśli człowiek zajął miejsce, zabieramy jednego bota. */
+      if (t.seats.filter(Boolean).length + t.bots.length > t.maxSeats) t.bots.pop();
       me.role = 'guest';
       me.tableNo = t.no;
-      send(socket, { type: 'joined', no: t.no, host: t.hostName });
-      /* Gospodarz dowiaduje się o nowym graczu tak samo jak przez Bluetooth. */
-      send(t.host, { type: 'peerJoined', peer: String(me.id), name: me.name, avatar: me.avatar });
+      send(socket, { type: 'joined', no: t.no, host: hostName(t) });
+      clearTTL(t); t.spi = false;
+      sendRoster(t);
       broadcastTableList();
       break;
     }
 
-    /* --- wracam do stołu, przy którym już siedziałem --- */
+    /* --- wracam do stołu, przy którym już siedziałem (ten sam pid) --- */
     case 'rejoinTable': {
       const t = tables.get(parseInt(msg.no, 10));
       if (!t) { send(socket, { type: 'joinFailed', reason: 'Ten stół już wygasł.' }); break; }
-      obudzTable(t);
 
-      const bylGospodarzem = (t.hostName === me.name);
-      if (bylGospodarzem) {
-        t.host = socket;
-        me.role = 'host'; me.tableNo = t.no;
-        send(socket, { type: 'rejoined', no: t.no, role: 'host' });
-        if (t.gra && t.numerGracza) {
-          if (!t.numerGracza.has(String(me.id))) {
-            const stary = [...t.numerGracza.entries()]
-              .find(([id, nr]) => t.gra.playerNames[nr] === me.name);
-            if (stary) { t.numerGracza.delete(stary[0]); t.numerGracza.set(String(me.id), stary[1]); }
-          }
-          const nr = t.numerGracza.get(String(me.id));
-          if (nr !== undefined) send(socket, { type: 'stanGry', G: SILNIK.widokDla(t.gra, nr) });
-        }
-      } else {
-        t.guests.add(socket);
-        me.role = 'guest'; me.tableNo = t.no;
-        send(socket, { type: 'rejoined', no: t.no, role: 'guest', host: t.hostName });
-        send(t.host, { type: 'peerJoined', peer: String(me.id), name: me.name, avatar: me.avatar, wraca: true });
-        /* Ostatni znany stan, żeby gracz od razu zobaczył stół zamiast pustego ekranu. */
-        if (t.gra) {
-          /* Po powrocie gracz odzyskuje swoje miejsce, choć ma nowe połączenie. */
-          if (t.numerGracza && !t.numerGracza.has(String(me.id))) {
-            const stary = [...t.numerGracza.entries()]
-              .find(([id, nr]) => t.gra.playerNames[nr] === me.name);
-            if (stary) { t.numerGracza.delete(stary[0]); t.numerGracza.set(String(me.id), stary[1]); }
-          }
-          const nr = t.numerGracza && t.numerGracza.get(String(me.id));
-          if (nr !== undefined) send(socket, { type: 'stanGry', G: SILNIK.widokDla(t.gra, nr) });
-        } else {
-          const zapis = t.stany && t.stany[me.name];
-          if (zapis) send(socket, { type: 'relay', payload: zapis });
+      const idx = seatIndexOfPid(t, me.pid);
+      if (idx >= 0) { attachToSeat(socket, t, idx); break; }
+
+      /* Miejsce zostało zwolnione (np. świadome wyjście), ale stół żyje — jeśli lobby ma
+         wolne miejsce, można usiąść na nowo. */
+      if (!t.started) {
+        const wolne = t.seats.indexOf(null);
+        if (wolne >= 0) {
+          t.seats[wolne] = { pid: me.pid, name: me.name, avatar: me.avatar, role: 'guest', connected: true, socket };
+          if (t.seats.filter(Boolean).length + t.bots.length > t.maxSeats) t.bots.pop();
+          me.role = 'guest'; me.tableNo = t.no;
+          send(socket, { type: 'rejoined', no: t.no, role: 'guest', host: hostName(t) });
+          clearTTL(t); t.spi = false;
+          sendRoster(t);
+          broadcastTableList();
+          break;
         }
       }
-      broadcastTableList();
+      send(socket, { type: 'joinFailed', reason: 'Twoje miejsce przy tym stole już nie istnieje.' });
       break;
     }
 
-    /* --- wstaję od stołu --- */
+    /* --- świadome wyjście: zwalnia miejsce (inaczej niż utrata połączenia) --- */
     case 'leaveTable': {
-      leave(socket);
+      explicitLeave(socket);
       break;
     }
 
-    /* --- gra się zaczyna --- */
     /* --- ruch gracza; jedyne wejście do partii --- */
     case 'ruch': {
       const t = tables.get(me.tableNo);
       if (!t || !t.gra) break;
-      const numer = t.numerGracza ? t.numerGracza.get(String(me.id)) : undefined;
+      const numer = t.numerGracza ? t.numerGracza.get(me.pid) : undefined;
       if (numer === undefined) { send(socket, { type: 'ruchOdrzucony', why: 'Nie siedzisz przy tym stole.' }); break; }
       const wynik = SILNIK.wykonaj(t.gra, numer, msg.action);
       if (!wynik.ok) { send(socket, { type: 'ruchOdrzucony', why: wynik.why }); break; }
@@ -268,25 +408,33 @@ function handle(socket, msg) {
       break;
     }
 
+    /* --- gra się zaczyna --- */
     case 'started': {
       const t = tables.get(me.tableNo);
-      if (!(t && t.host === socket)) break;
+      if (!(t && t.hostPid === me.pid)) break;
+      if (t.started) break;
       t.started = true;
 
       /* Od tego momentu partię prowadzi serwer. Gospodarz staje się zwykłym graczem —
-         jego wyjście nie zatrzymuje gry, a każdy dostaje wyłącznie własny widok kart. */
-      const przyStole = [{ id: me.id, name: me.name, avatar: me.avatar, bot: false }];
-      for (const g of t.guests) {
-        const cg = clients.get(g);
-        if (cg) przyStole.push({ id: cg.id, name: cg.name, avatar: cg.avatar, bot: false });
-      }
-      const boty = Math.max(0, msg.boty || 0);
-      for (let i = 0; i < boty && przyStole.length < t.seats; i++) {
-        przyStole.push({ id: 'bot' + i, name: 'Bot ' + i, avatar: '🤖', bot: true });
+         jego wyjście nie zatrzymuje gry, a każdy dostaje wyłącznie własny widok kart.
+         Skład bierzemy z rostera serwera: ludzie na swoich miejscach, boty w lukach. */
+      const przyStole = [];
+      let bi = 0;
+      const botyDeklarowane = (t.bots.length > 0)
+        ? t.bots.slice()
+        : Array.from({ length: Math.max(0, msg.boty || 0) }, (_, i) => ({ name: 'Bot ' + i, avatar: '🤖' }));
+      for (let i = 0; i < t.maxSeats; i++) {
+        const s = t.seats[i];
+        if (s) {
+          przyStole.push({ id: s.pid, name: s.name, avatar: s.avatar, bot: false });
+        } else if (bi < botyDeklarowane.length) {
+          const b = botyDeklarowane[bi++];
+          przyStole.push({ id: 'bot' + i, name: b.name, avatar: b.avatar, bot: true });
+        }
       }
 
       t.gra = SILNIK.nowaGra({ gracze: przyStole, miejsca: przyStole.length, bombLimit: t.bombs });
-      /* Silnik zna graczy po numerze w partii, serwer po identyfikatorze połączenia. */
+      /* Silnik zna graczy po numerze w partii, serwer po trwałym pid. */
       t.numerGracza = new Map();
       przyStole.forEach((g, i) => { if (!g.bot) t.numerGracza.set(String(g.id), i); });
       SILNIK.rozdaj(t.gra, Math.random);
@@ -296,66 +444,106 @@ function handle(socket, msg) {
       break;
     }
 
-    /* --- przekazanie wiadomości gry --- */
+    /* --- przekazanie wiadomości gry (ścieżka zgodności dla trybu host-run) --- */
     case 'relay': {
       const t = tables.get(me.tableNo);
       if (!t) break;
+      const jestemHostem = (t.hostPid === me.pid);
 
-      if (t.host === socket) {
+      if (jestemHostem) {
         /* Zapamiętujemy ostatni stan wysłany każdemu graczowi, żeby po powrocie móc go
-           odtworzyć bez czekania na kolejny ruch. */
+           odtworzyć bez czekania na kolejny ruch. Zapis wiążemy z PID odbiorcy. */
         if (msg.to && msg.payload && msg.payload.type === 'state') {
-          /* Zapis wiążemy z PSEUDONIMEM, nie z identyfikatorem połączenia — po powrocie
-             gracz dostaje nowe połączenie i nowy identyfikator, więc zapis po nim
-             byłby nie do odnalezienia. */
-          const odbiorca = [...clients.values()].find(x => String(x.id) === String(msg.to));
-          if (odbiorca && odbiorca.name) {
-            t.stany = t.stany || {};
-            t.stany[odbiorca.name] = msg.payload;
-          }
+          const idx = seatIndexOfPid(t, String(msg.to));
+          if (idx >= 0) { t.stany = t.stany || {}; t.stany[String(msg.to)] = msg.payload; }
         }
-        /* Gospodarz do konkretnego gracza albo do wszystkich. Adresowanie jest istotne:
-           każdy ma widzieć wyłącznie swoje karty. */
         if (msg.to) {
-          for (const g of t.guests) {
-            const c = clients.get(g);
-            if (c && String(c.id) === String(msg.to)) send(g, { type: 'relay', payload: msg.payload });
-          }
+          const idx = seatIndexOfPid(t, String(msg.to));
+          if (idx >= 0 && t.seats[idx].socket) send(t.seats[idx].socket, { type: 'relay', payload: msg.payload });
         } else {
-          for (const g of t.guests) send(g, { type: 'relay', payload: msg.payload });
+          for (const s of t.seats) {
+            if (s && s.pid && s.role !== 'host' && s.socket) send(s.socket, { type: 'relay', payload: msg.payload });
+          }
         }
       } else {
         /* Gracz zawsze mówi do gospodarza. */
-        send(t.host, { type: 'relay', peer: String(me.id), payload: msg.payload });
+        const h = hostSeat(t);
+        if (h && h.socket) send(h.socket, { type: 'relay', peer: me.pid, payload: msg.payload });
       }
       break;
     }
   }
 }
 
-function leave(socket) {
+/** Podpięcie istniejącego (zarezerwowanego) miejsca do nowego połączenia — powrót gracza. */
+function attachToSeat(socket, t, idx) {
+  const me = clients.get(socket);
+  const seat = t.seats[idx];
+  if (!me || !seat) return;
+
+  seat.connected = true;
+  seat.socket = socket;
+  if (me.name) seat.name = me.name;
+  if (me.avatar) seat.avatar = me.avatar;
+
+  me.role = seat.role;
+  me.tableNo = t.no;
+
+  clearTTL(t); t.spi = false;
+
+  send(socket, { type: 'rejoined', no: t.no, role: seat.role, host: hostName(t) });
+
+  if (t.gra && t.numerGracza) {
+    const nr = t.numerGracza.get(seat.pid);
+    if (nr !== undefined) send(socket, { type: 'stanGry', G: SILNIK.widokDla(t.gra, nr) });
+  } else if (t.stany && t.stany[seat.pid]) {
+    send(socket, { type: 'relay', payload: t.stany[seat.pid] });
+  }
+
+  sendRoster(t);
+  broadcastTableList();
+}
+
+/* Świadome wyjście — ZWALNIA miejsce. Host wychodzący z lobby zamyka cały stół. */
+function explicitLeave(socket) {
   const me = clients.get(socket);
   if (!me) return;
+  const t = me.tableNo ? tables.get(me.tableNo) : null;
 
-  if (me.role === 'host' && me.tableNo) {
-    const t = tables.get(me.tableNo);
-    if (t && t.started) {
-      /* Rozpoczęta partia czeka na powrót gospodarza — nie kasujemy jej od razu. */
-      for (const g of t.guests) send(g, { type: 'hostAway', no: t.no });
-      uspijTable(me.tableNo);
-    } else {
-      closeTable(me.tableNo, 'Gospodarz opuścił stół.');
+  if (t) {
+    if (t.hostPid === me.pid && !t.started) {
+      /* Świadome wyjście gospodarza z lobby = koniec stołu dla wszystkich. */
+      closeTable(t.no, 'Gospodarz zamknął stół.');
+      me.tableNo = null; me.role = 'idle';
+      return;
     }
-  } else if (me.role === 'guest' && me.tableNo) {
-    const t = tables.get(me.tableNo);
-    if (t) {
-      t.guests.delete(socket);
-      send(t.host, { type: 'peerLeft', peer: String(me.id), name: me.name });
-      broadcastTableList();
+    const idx = seatIndexOfPid(t, me.pid);
+    if (idx >= 0) {
+      t.seats[idx] = null;
+      if (t.numerGracza) t.numerGracza.delete(me.pid);
+      sendRoster(t);
+      recomputeLifecycle(t);
     }
   }
   me.tableNo = null;
   me.role = 'idle';
+}
+
+/* Utrata połączenia — REZERWUJE miejsce. Miejsce zostaje, gracz oznaczony jako offline.
+   Jeśli zniknął ostatni połączony człowiek, zaczyna biec TTL. */
+function onDisconnect(socket) {
+  const me = clients.get(socket);
+  if (!me) return;
+  const t = me.tableNo ? tables.get(me.tableNo) : null;
+  if (t) {
+    const idx = seatIndexOfPid(t, me.pid);
+    if (idx >= 0 && t.seats[idx]) {
+      t.seats[idx].connected = false;
+      t.seats[idx].socket = null;
+      sendRoster(t);
+      recomputeLifecycle(t);
+    }
+  }
 }
 
 /* -------------------------------------------------------------- serwer */
@@ -374,7 +562,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (socket) => {
-  clients.set(socket, { id: nextId++, name: 'Gracz', avatar: '🦊', tableNo: null, role: 'idle' });
+  clients.set(socket, { pid: null, name: 'Gracz', avatar: '🦊', tableNo: null, role: 'idle' });
 
   socket.on('message', (raw) => {
     let msg;
@@ -383,15 +571,15 @@ wss.on('connection', (socket) => {
     try { handle(socket, msg); } catch (e) { console.error('Błąd obsługi:', e.message); }
   });
 
-  socket.on('close', () => { leave(socket); clients.delete(socket); });
-  socket.on('error', () => { leave(socket); clients.delete(socket); });
+  socket.on('close', () => { onDisconnect(socket); clients.delete(socket); });
+  socket.on('error', () => { onDisconnect(socket); clients.delete(socket); });
 
   /* Utrzymanie łącza: pośrednicy lubią zamykać ciche połączenia. */
   socket.isAlive = true;
   socket.on('pong', () => { socket.isAlive = true; });
 });
 
-setInterval(() => {
+const pingTimer = setInterval(() => {
   for (const socket of wss.clients) {
     if (socket.isAlive === false) { socket.terminate(); continue; }
     socket.isAlive = false;
@@ -399,6 +587,31 @@ setInterval(() => {
   }
 }, 25000);
 
-server.listen(PORT, () => {
-  console.log('Serwer stołów Tysiąca nasłuchuje na porcie ' + PORT);
-});
+/* Uruchamiamy nasłuch tylko przy bezpośrednim wywołaniu (`node server.js`). Gdy plik jest
+   wymagany jako moduł (test), nie zajmujemy portu — testy wołają start() same.
+   PORT=0 pozwala systemowi wybrać wolny port; logujemy ten faktyczny, żeby testy mogły go
+   odczytać ze standardowego wyjścia. */
+function start(port, cb) {
+  return server.listen(port === undefined ? PORT : port, () => {
+    const p = server.address().port;
+    console.log('Serwer stołów Tysiąca nasłuchuje na porcie ' + p);
+    if (typeof cb === 'function') cb(p);
+  });
+}
+
+if (require.main === module) {
+  start();
+}
+
+/* Eksport na potrzeby testów — pozwala podnieść serwer na losowym porcie i zamknąć go
+   czysto. */
+module.exports = { server, wss, tables, clients, start, closeAll };
+
+function closeAll() {
+  clearInterval(pingTimer);
+  for (const t of tables.values()) { clearTTL(t); if (t.timerGry) clearTimeout(t.timerGry); }
+  tables.clear();
+  for (const s of wss.clients) { try { s.terminate(); } catch (e) {} }
+  try { wss.close(); } catch (e) {}
+  try { server.close(); } catch (e) {}
+}

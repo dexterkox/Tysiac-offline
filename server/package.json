@@ -5,6 +5,6 @@
   "description": "Serwer stołów do gry Tysiąc — lista stołów i przekazywanie wiadomości",
   "main": "server.js",
   "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" },
+  "scripts": { "start": "node server.js", "test": "node --test test/*.test.js" },
   "dependencies": { "ws": "^8.18.0" }
 }

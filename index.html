@@ -1823,6 +1823,9 @@ function backToMenu(){
       else if(NET.pc){ NET.pc.close(); }
     }catch(e){}
   }
+  /* Świadome wyjście ZWALNIA miejsce (i kasuje zapis powrotu) — inaczej niż utrata łącza. */
+  try{ if(typeof Online!=='undefined') Online.leaveTable(); }catch(e){}
+  try{ zapomnijStol(); }catch(e){}
   /* Zwalniamy oba kanały, inaczej stół zostawałby ogłoszony po wyjściu. */
   try{ if(typeof Nearby!=='undefined') Nearby.stop(); }catch(e){}
   try{ if(typeof Online!=='undefined') Online.stop(); }catch(e){}
@@ -4200,6 +4203,42 @@ function saveProfile() {
 
 function hasProfile() { return !!(myName && myName.length >= 2); }
 
+/* Trwały, anonimowy identyfikator urządzenia. To ON — nie pseudonim i nie gniazdo —
+   jest tożsamością gracza: pozwala wrócić na swoje miejsce po rozłączeniu, restarcie
+   aplikacji czy powrocie z tła. Bez kont i bez bazy danych. */
+const PID_KEY = 'tysiac_pid';
+const STOL_KEY = 'tysiac_stol';
+let myPid = '';
+
+function loadPid() {
+  try {
+    let p = localStorage.getItem(PID_KEY);
+    if (!p) {
+      p = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+        : ('pid-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+      localStorage.setItem(PID_KEY, p);
+    }
+    myPid = p;
+  } catch (e) {
+    myPid = myPid || ('pid-' + Math.random().toString(36).slice(2));
+  }
+  return myPid;
+}
+
+/* Ostatni stół zapamiętujemy, żeby po restarcie aplikacji spróbować wrócić — o ile serwer
+   wciąż go trzyma. Zapis czyścimy TYLKO przy świadomym wyjściu. */
+function zapiszStol(no, role) {
+  try { localStorage.setItem(STOL_KEY, JSON.stringify({ no: Number(no), role: role || 'guest' })); } catch (e) {}
+}
+function wczytajStol() {
+  try { const r = localStorage.getItem(STOL_KEY); return r ? JSON.parse(r) : null; } catch (e) { return null; }
+}
+function zapomnijStol() {
+  try { localStorage.removeItem(STOL_KEY); } catch (e) {}
+}
+
+loadPid();
+
 let room = null;                  /* stan poczekalni u gospodarza */
 let roomList = [];                /* pokoje znalezione przy przeglądaniu */
 let browseTimer = null;
@@ -4259,7 +4298,7 @@ const Online = {
         this.recProba = 0;
         netLinkLost = false;      /* świeże łącze = brak powodu do ostrzeżenia */
         try{ odswiezStanSerwera(); }catch(e){}
-        s.send(JSON.stringify({ type: 'hello', name: myName, avatar: myAvatar }));
+        s.send(JSON.stringify({ type: 'hello', pid: myPid, name: myName, avatar: myAvatar }));
         resolve();
       };
       s.onmessage = (ev) => {
@@ -4290,11 +4329,29 @@ const Online = {
 
   route(m) {
     switch (m.type) {
-      case 'welcome':      this.myId = m.id; break;
+      case 'welcome':
+        this.myId = m.pid || m.id;
+        this.resume = m.resume || null;
+        if (this.onWelcome) { const cb = this.onWelcome; this.onWelcome = null; try { cb(m); } catch (e) {} }
+        break;
+      case 'helloRejected':
+        this.stan = 'blad'; this.blad = m.reason || 'Serwer odrzucił połączenie.';
+        try { odswiezStanSerwera(); } catch (e) {}
+        break;
       case 'tables':
         if (this.onTables) this.onTables(m.tables || []);
         break;
-      case 'tableCreated': this.tableNo = m.no; this.mojStol = m.no; break;
+      case 'tableCreated':
+        this.tableNo = m.no; this.mojStol = m.no;
+        zapiszStol(m.no, 'host');
+        break;
+      case 'createFailed':
+        if (m.no) { this.tableNo = m.no; this.mojStol = m.no; }
+        if (this.handlers.onError) this.handlers.onError(m.reason || 'Nie udało się założyć stołu.');
+        break;
+      case 'roster':
+        try { applyServerRoster(m); } catch (e) {}
+        break;
       case 'stanGry': {
         /* Serwer przysyła gotowy stan — przyjmujemy go bez pytania, bo to jedyne
            źródło prawdy o partii. */
@@ -4329,6 +4386,8 @@ const Online = {
       case 'rejoined':
         netLinkLost = false;
         this.stan='polaczony'; this.blad='';
+        this.tableNo = m.no; this.mojStol = m.no;
+        zapiszStol(m.no, m.role || 'guest');
         try{ odswiezStanSerwera(); render(); }catch(e){}
         break;
       case 'hostAway':
@@ -4338,7 +4397,8 @@ const Online = {
         }
         break;
       case 'joined':
-        this.tableNo = m.no;
+        this.tableNo = m.no; this.mojStol = m.no;
+        zapiszStol(m.no, 'guest');
         if (this.handlers.onConnected) this.handlers.onConnected(String(m.host || ''));
         break;
       case 'peerJoined':
@@ -4354,6 +4414,7 @@ const Online = {
         break;
       case 'joinFailed':
       case 'tableClosed':
+        try { zapomnijStol(); } catch (e) {}
         if (this.handlers.onError) this.handlers.onError(m.reason || 'Stół niedostępny.');
         break;
     }
@@ -4392,6 +4453,17 @@ const Online = {
     if (this.sock && this.ready) this.sock.send(JSON.stringify({ type: 'started', boty: boty || 0 }));
   },
 
+  /* Host deklaruje boty przy stole — serwer jest źródłem prawdy o składzie. */
+  syncBots(bots) {
+    if (this.sock && this.ready) this.sock.send(JSON.stringify({ type: 'syncBots', bots: bots || [] }));
+  },
+
+  /* Świadome opuszczenie stołu: ZWALNIA miejsce (inaczej niż zwykłe zamknięcie łącza,
+     które je rezerwuje). */
+  leaveTable() {
+    try { if (this.sock && this.ready) this.sock.send(JSON.stringify({ type: 'leaveTable' })); } catch (e) {}
+  },
+
   send(obj, peer) {
     if (!this.sock || !this.ready) return;
     this.sock.send(JSON.stringify({ type: 'relay', to: peer || null, payload: obj }));
@@ -4425,7 +4497,7 @@ const Online = {
         this.recProba = 0;
         netLinkLost = false;
         /* Serwer musi wiedzieć, kim jesteśmy po powrocie. */
-        try { this.sock.send(JSON.stringify({ type:'hello', name: myName, avatar: myAvatar })); } catch(e){}
+        try { this.sock.send(JSON.stringify({ type:'hello', pid: myPid, name: myName, avatar: myAvatar })); } catch(e){}
         this.rejoin();
         try{ render(); }catch(e){}
       }).catch(() => { /* następna próba poleci z onclose */ });
@@ -4747,6 +4819,9 @@ async function startHostingRoom() {
 }
 
 function closeRoomHost() {
+  /* Świadome zamknięcie stołu przez gospodarza zamyka go dla wszystkich (zwalnia miejsce). */
+  try { Online.leaveTable(); } catch (e) {}
+  try { zapomnijStol(); } catch (e) {}
   try { if (typeof Nearby !== 'undefined') Nearby.stop(); } catch (e) {}
   try { Online.stop(); } catch (e) {}
   room = null;
@@ -4807,15 +4882,26 @@ function roomAddBot() {
                     avatar: '🤖' });
   renderRoomSeats();
   broadcastRoom();
+  syncBotsIfOnline();
 }
 
 function roomRemoveSeat(i) {
   if (!room) return;
   const s = room.seats[i];
   if (!s || s.me) return;
+  /* Online usuwać można tylko boty — ludzi trzyma serwer. */
+  if (trybSieci === 'online' && s.kind !== 'bot') return;
   room.seats.splice(i, 1);
   renderRoomSeats();
   broadcastRoom();
+  syncBotsIfOnline();
+}
+
+/* Wysyła serwerowi aktualny skład botów przy stole (tylko online, tylko host). */
+function syncBotsIfOnline() {
+  if (trybSieci !== 'online' || !room || !NET || NET.role !== 'host') return;
+  const bots = room.seats.filter(s => s.kind === 'bot').map(s => ({ name: s.name, avatar: s.avatar }));
+  try { Online.syncBots(bots); } catch (e) {}
 }
 
 function tableRulesText(seats, bombs) {
@@ -4833,9 +4919,13 @@ function renderRoomSeats() {
     const row = document.createElement('div');
     row.className = 'seatrow' + (s ? '' : ' empty');
     if (s) {
+      const offline = (s.connected === false);
       row.innerHTML = '<span class="savatar">' + s.avatar + '</span>'
-                    + '<span class="sname">' + s.name + (s.me ? ' (Ty)' : '') + '</span>';
-      if (!s.me) {
+                    + '<span class="sname">' + s.name + (s.me ? ' (Ty)' : '')
+                    + (offline ? ' <span style="opacity:.6;font-size:.8em">• wraca…</span>' : '') + '</span>';
+      /* Online nie kickujemy ludzi (serwer jest źródłem prawdy o składzie) — usuwać można tylko boty. */
+      const canRemove = !s.me && (trybSieci !== 'online' || s.kind === 'bot');
+      if (canRemove) {
         const x = document.createElement('button');
         x.className = 'sremove'; x.textContent = '✕';
         x.title = 'Usuń z pokoju';
@@ -4857,7 +4947,8 @@ function renderRoomSeats() {
   b.textContent = canStart ? ('Rozpocznij grę (' + humans + ')') : 'Potrzeba co najmniej 2 graczy';
 }
 
-/* Poczekalnia u gości musi odzwierciedlać to, co widzi gospodarz. */
+/* Poczekalnia u gości musi odzwierciedlać to, co widzi gospodarz.
+   W trybie ONLINE roster rozsyła serwer (źródło prawdy), więc tu tylko kanał obok siebie. */
 function broadcastRoom() {
   if (!room || !NET || NET.role !== 'host') return;
   const view = {
@@ -4867,7 +4958,63 @@ function broadcastRoom() {
     seats: room.seats.map(s => ({ name: s.name, avatar: s.avatar, kind: s.kind }))
   };
   try { Nearby.send(view); } catch (e) {}
-  try { Online.send(view); } catch (e) {}
+}
+
+/* Serwer jest źródłem prawdy o składzie stołu online. Ten sam roster odświeża poczekalnię
+   zarówno u gospodarza, jak i u gości — także tych, którzy właśnie się rozłączyli
+   (widnieją jako „wraca…"). Host offline NIE traci roli i nie jest zastępowany. */
+function applyServerRoster(m) {
+  if (trybSieci !== 'online') return;               /* offline korzysta z broadcastRoom */
+  /* W trakcie partii planszą rządzi stanGry — rostera używamy tylko w poczekalni. */
+  if (G && G.mode === 'network' && G.phase && G.phase !== 'menu') return;
+  if (m.started) return;
+
+  const seats = m.seats || [];
+  const amHost = (m.hostPid && m.hostPid === myPid);
+
+  if (amHost) {
+    if (!room) room = { bombLimit: 0 };
+    room.no = m.no; room.onlineNo = m.no;
+    room.maxSeats = seats.length || room.maxSeats || 3;
+    room.started = false;
+    room.seats = seats.filter(Boolean).map(s => s.bot
+      ? { kind: 'bot', name: s.name, avatar: s.avatar }
+      : { kind: 'human', name: s.name, avatar: s.avatar, pid: s.pid,
+          me: (s.pid === myPid), connected: s.connected, role: s.role });
+    NET = NET || {}; NET.role = 'host'; NET.online = true;
+    const tt = el('roomHostTitle'); if (tt) tt.textContent = 'Stół #' + m.no;
+    el('roomBrowser').style.display = 'none';
+    el('roomGuest').style.display = 'none';
+    el('roomHost').style.display = 'flex';
+    renderRoomSeats();
+  } else {
+    NET = NET || {}; NET.role = 'client'; NET.online = true;
+    const tt = el('roomGuestTitle'); if (tt) tt.textContent = 'Stół #' + m.no;
+    el('roomBrowser').style.display = 'none';
+    el('roomHost').style.display = 'none';
+    el('roomGuest').style.display = 'flex';
+    renderGuestRosterSeats(seats);
+  }
+}
+
+function renderGuestRosterSeats(seats) {
+  const wrap = el('guestSeats');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  (seats || []).forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'seatrow' + (s ? '' : ' empty');
+    if (s) {
+      const offline = (!s.bot && s.connected === false);
+      const mine = (!s.bot && s.pid === myPid);
+      row.innerHTML = '<span class="savatar">' + s.avatar + '</span>'
+                    + '<span class="sname">' + s.name + (mine ? ' (Ty)' : '')
+                    + (offline ? ' <span style="opacity:.6;font-size:.8em">• wraca…</span>' : '') + '</span>';
+    } else {
+      row.innerHTML = '<span class="savatar">⋯</span><span class="sname">wolne miejsce</span>';
+    }
+    wrap.appendChild(row);
+  });
 }
 
 function roomStart() {
@@ -5137,6 +5284,9 @@ async function joinRoom(t) {
 }
 
 function leaveRoom() {
+  /* Świadome opuszczenie stołu przez gościa zwalnia jego miejsce. */
+  try { Online.leaveTable(); } catch (e) {}
+  try { zapomnijStol(); } catch (e) {}
   try { if (typeof Nearby !== 'undefined') Nearby.stop(); } catch (e) {}
   try { Online.stop(); } catch (e) {}
   NET = null;
@@ -5244,24 +5394,52 @@ broadcastState = function () {
    wraca na wierzch, i w razie potrzeby wznawiamy — bez tego gra zastygała bez reakcji. */
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
-  if (!(G && G.mode === 'network')) return;
+  const wGrze = (G && G.mode === 'network');
+  const wPoczekalni = (trybSieci === 'online' && !!wczytajStol() && !wGrze);
+  if (!wGrze && !wPoczekalni) return;
   const zywe = Online.sock && Online.sock.readyState === 1;
   if (zywe) {
     Online.rejoin();          /* potwierdzamy, że wciąż siedzimy przy stole */
-  } else {
+  } else if (wGrze) {
     Online.recProba = 0;
     Online.recZatrzymane = false;
     Online.wznow();
+  } else {
+    attemptAutoResume();      /* w poczekalni odtwarzamy połączenie od zera */
   }
   try { render(); } catch (e) {}
 });
 
 /* To samo przy powrocie sieci — np. po wyjściu z windy albo przełączeniu Wi-Fi na sieć komórkową. */
 window.addEventListener('online', () => {
-  if (G && G.mode === 'network' && !(Online.sock && Online.sock.readyState === 1)) {
+  const zywe = Online.sock && Online.sock.readyState === 1;
+  if (G && G.mode === 'network' && !zywe) {
     Online.recProba = 0; Online.recZatrzymane = false; Online.wznow();
+  } else if (trybSieci === 'online' && !!wczytajStol() && !zywe) {
+    attemptAutoResume();
   }
 });
+
+/* Auto-powrót do stołu po restarcie/odświeżeniu aplikacji — o ile serwer wciąż go trzyma.
+   Tożsamością jest trwały pid, więc wracamy na swoje miejsce (a jako host — pozostajemy hostem). */
+function attemptAutoResume() {
+  if (trybSieci !== 'online') return;
+  const saved = wczytajStol();
+  if (!saved || !saved.no || !hasProfile()) return;
+  Online.mojStol = saved.no;
+  Online.handlers = Online.handlers || {};
+  Online.handlers.onError = () => { zapomnijStol(); };   /* stół zniknął — sprzątamy zapis */
+  if (Online.sock && Online.sock.readyState === 1) { Online.rejoin(); return; }
+  Online.onWelcome = (m) => {
+    if (m.resume && Number(m.resume.no) === Number(saved.no)) {
+      Online.mojStol = saved.no;
+      Online.rejoin();
+    } else {
+      zapomnijStol();
+    }
+  };
+  Online.connect().catch(() => { /* brak sieci — spróbujemy przy powrocie okna/sieci */ });
+}
 
 applyScale();
 window.addEventListener('resize', ()=>{ applyScale(); try{ render(); }catch(e){} });
@@ -5273,6 +5451,9 @@ if (!loadProfile()) {
   setTimeout(() => askIdentity(null), 500);
 }
 renderProfileBadge();
+
+/* Po starcie spróbuj wrócić do zapamiętanego stołu (jeśli serwer wciąż go trzyma). */
+setTimeout(() => { try { attemptAutoResume(); } catch (e) {} }, 300);
 
 </script>
 </body>
